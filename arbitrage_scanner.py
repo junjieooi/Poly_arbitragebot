@@ -207,13 +207,11 @@ class ArbitrageScanner:
         total_price = sum(prices)
 
         # Account for fees
-        # Note: Polymarket charges fees on profit, not total transaction
-        # For buy-all: cost = sum(prices), guaranteed payout = $1, profit = 1 - cost
-        # Fee is charged on the profit when position resolves
-        # For sell-all: receive = sum(prices), pay out = $1, profit = receive - 1
-        # This is a simplified model; actual fee structure may vary
-        effective_total_buy = total_price + (1.0 - total_price) * self.fee_rate  # Cost + fee on profit
-        effective_total_sell = total_price - (total_price - 1.0) * self.fee_rate  # Revenue - fee on profit
+        # For buy-all: We pay total_price + fees on that purchase, guaranteed payout = $1
+        # For sell-all: We receive total_price - fees on that sale, pay out = $1
+        # Fee is charged on the transaction amount, not on profit
+        effective_total_buy = total_price * (1 + self.fee_rate)  # Cost including fees
+        effective_total_sell = total_price * (1 - self.fee_rate)  # Revenue after fees
         
         # Sell all opportunity (prices sum > $1)
         if effective_total_sell > 1.0:
@@ -457,19 +455,24 @@ class StatisticalArbitrage:
 
         if market_price >= 1.0 or market_price <= 0:
             return 0.0
-        
-        # Odds
+
+        # Odds (decimal odds minus 1)
         b = (1.0 / market_price) - 1
-        
-        # Probabilities
-        p = fair_value * confidence  # Adjust for confidence
+
+        # Use fair_value directly as win probability (don't multiply by confidence here)
+        # Confidence will be applied to the final sizing
+        p = fair_value
         q = 1 - p
-        
-        # Kelly fraction
+
+        # Kelly fraction: f* = (bp - q) / b
         kelly = (b * p - q) / b
-        
-        # Use fractional Kelly (1/4 Kelly for safety)
-        return max(0, kelly * 0.25)
+
+        if kelly <= 0:
+            return 0.0
+
+        # Use fractional Kelly (1/4 Kelly for safety) and apply confidence
+        # Confidence reduces position size when we're less certain
+        return kelly * 0.25 * confidence
     
     def calculate_expected_value(self,
                                 market_price: float,

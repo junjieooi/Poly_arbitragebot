@@ -1,0 +1,54 @@
+# Phase 1 Configuration - Data Pipeline & Simple Arbitrage Detection
+# Copy to config/local_config.yaml and customize for your environment
+
+# WebSocket Feed Settings
+websocket:
+  url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  heartbeat_interval: 30  # seconds
+  max_reconnect_attempts: 10
+  base_reconnect_delay: 1.0  # seconds
+  max_reconnect_delay: 60.0  # seconds
+  change_threshold: 0.02  # 2% change triggers event
+
+# Polygon Blockchain Monitor
+polygon:
+  # Set via environment variable POLYGON_RPC_URL for security
+  # rpc_url: "https://polygon-mainnet.g.alchemy.com/v2/YOUR_KEY"
+  contract_address: "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+  poll_interval: 2.0  # seconds (Polygon block time is ~2s)
+  max_history_blocks: 950  # ~30 minutes of history
+  arbitrage_threshold: 0.02  # 2% deviation
+
+# Simple Arbitrage Detector
+arbitrage:
+  buy_threshold: 0.98  # Total cost must be below this for buy arb
+  sell_threshold: 1.02  # Total proceeds must be above this for sell arb
+  min_profit: 0.05  # Minimum $0.05 profit to flag
+  check_interval: 0.5  # seconds
+  database_path: "data/arbitrage_opportunities.db"
+
+# Markets to Monitor
+# Each market needs:
+#   - market_id: Unique identifier (usually condition_id)
+#   - question: Human-readable question
+#   - yes_token: Token ID for YES outcome
+#   - no_token: Token ID for NO outcome
+#
+# Find markets at: https://polymarket.com/
+# Use API to get token IDs: https://clob.polymarket.com/markets
+markets: []
+#  - market_id: "0x..."
+#    question: "Will X happen by Y?"
+#    yes_token: "12345..."
+#    no_token: "67890..."
+
+# Logging
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  file: "logs/phase1.log"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+# Statistics Display
+stats:
+  display_interval: 60  # seconds
+  lookback_hours: 24

@@ -38,6 +38,11 @@ from telegram_alerts import TelegramNotifier, TelegramConfig
 # Low-risk mode indicator
 LOW_RISK_MODE = True
 
+# API operation timeouts (in seconds)
+API_TIMEOUT_MARKETS = 30.0
+API_TIMEOUT_PRICE = 10.0
+API_TIMEOUT_ORDER = 15.0
+
 logger = get_logger(__name__)
 trading_logger = TradingLogger(__name__)
 
@@ -71,6 +76,7 @@ class PolymarketBot:
         # State
         self.positions: list[Position] = []
         self.portfolio_value = config.simulation.initial_bankroll
+        self._pending_tasks: list[asyncio.Task] = []
 
         # Telegram alerts
         self.telegram: Optional[TelegramNotifier] = None
@@ -127,13 +133,37 @@ class PolymarketBot:
             )
 
     async def stop(self):
-        """Gracefully stop the bot"""
+        """Gracefully stop the bot with proper task cancellation"""
         logger.info("Shutting down...")
         self.running = False
 
+        # Cancel all pending tasks
+        if self._pending_tasks:
+            logger.info(f"Cancelling {len(self._pending_tasks)} pending tasks...")
+            for task in self._pending_tasks:
+                if not task.done():
+                    task.cancel()
+
+            # Wait for tasks to complete cancellation with timeout
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*self._pending_tasks, return_exceptions=True),
+                    timeout=10.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Some tasks did not cancel within timeout")
+
+            self._pending_tasks.clear()
+
         # Send Telegram shutdown alert
         if self.telegram:
-            await self.telegram.alert_bot_stopped("Manual shutdown")
+            try:
+                await asyncio.wait_for(
+                    self.telegram.alert_bot_stopped("Manual shutdown"),
+                    timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Telegram shutdown alert timed out")
             await self.telegram.close()
 
         if self.client:
@@ -146,8 +176,17 @@ class PolymarketBot:
         opportunities = []
 
         try:
-            # Fetch active markets
-            markets = await self.client.get_markets(limit=50, active=True)
+            # Fetch active markets with timeout
+            try:
+                markets = await asyncio.wait_for(
+                    self.client.get_markets(limit=50, active=True),
+                    timeout=API_TIMEOUT_MARKETS
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"Timeout fetching markets after {API_TIMEOUT_MARKETS}s")
+                trading_logger.api_error("get_markets", "Timeout")
+                return []
+
             logger.info(f"Scanning {len(markets)} active markets...")
 
             # Group markets by related conditions for multi-outcome analysis
@@ -162,7 +201,15 @@ class PolymarketBot:
                     if not token_id:
                         continue
 
-                    price = await self.client.get_price(token_id)
+                    try:
+                        price = await asyncio.wait_for(
+                            self.client.get_price(token_id),
+                            timeout=API_TIMEOUT_PRICE
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Timeout fetching price for {token_id}")
+                        continue
+
                     if price is None:
                         continue
 
@@ -306,12 +353,21 @@ class PolymarketBot:
                 for market_id, action, price in zip(opp.markets, opp.actions, opp.prices):
                     side = OrderSide.BUY if action == "BUY" else OrderSide.SELL
 
-                    order = await self.client.create_order(
-                        token_id=market_id,
-                        side=side,
-                        price=price,
-                        size=shares
-                    )
+                    try:
+                        order = await asyncio.wait_for(
+                            self.client.create_order(
+                                token_id=market_id,
+                                side=side,
+                                price=price,
+                                size=shares
+                            ),
+                            timeout=API_TIMEOUT_ORDER
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(f"Timeout creating order for {market_id}")
+                        if self.telegram:
+                            await self.telegram.alert_error("Order Timeout", f"Timeout creating order for {market_id}")
+                        return False
 
                     if order:
                         trading_logger.trade_executed(

@@ -53,11 +53,15 @@ class MonteCarloSimulator:
         self.num_simulations = num_simulations
         self.fee_rate = fee_rate
         self.results = []
+        self.random_seed = random_seed
 
-        # Set random seed for reproducibility
+        # Use RandomState instance for reproducibility instead of global seed
+        # This ensures results are reproducible even when other code uses np.random
         if random_seed is not None:
-            np.random.seed(random_seed)
+            self._rng = np.random.RandomState(random_seed)
             logger.info(f"Random seed set to {random_seed}")
+        else:
+            self._rng = np.random.RandomState()
     
     def simulate_trade(self,
                       entry_price: float,
@@ -80,26 +84,24 @@ class MonteCarloSimulator:
         """
         # Add noise to fair value to simulate model error
         noisy_fv = np.clip(
-            np.random.normal(fair_value, model_error),
+            self._rng.normal(fair_value, model_error),
             0.01, 0.99
         )
 
         # Outcome is determined by noisy fair value
-        outcome = np.random.random() < noisy_fv
+        outcome = self._rng.random() < noisy_fv
 
         # Calculate entry cost with fees
+        # Fee is charged on entry only (not double-charged on profit)
         entry_cost = position_size * entry_price
         if include_fees:
             entry_cost *= (1 + self.fee_rate)
 
         if outcome:
-            # Win: Receive $1 per share, minus fees on profit
+            # Win: Receive $1 per share
+            # Fee already included in entry_cost, don't charge again on profit
             gross_payout = position_size * 1.00
-            profit = gross_payout - entry_cost
-            if include_fees and profit > 0:
-                # Fee on profit
-                profit *= (1 - self.fee_rate)
-            pnl = profit
+            pnl = gross_payout - entry_cost
         else:
             # Lose: Lose entry cost
             pnl = -entry_cost
@@ -129,18 +131,18 @@ class MonteCarloSimulator:
             
             for trade_num in range(num_trades):
                 # Generate random market opportunity
-                market_price = np.random.uniform(0.30, 0.70)
-                
+                market_price = self._rng.uniform(0.30, 0.70)
+
                 if strategy_type == 'tail_betting':
                     # Strategy from original document: buy top outcomes
                     fair_value = market_price  # No edge, just hedging
                     edge = 0.0
                 elif strategy_type == 'kelly':
                     # Kelly with real edge
-                    edge = np.random.uniform(0.05, 0.15)  # 5-15c edge
+                    edge = self._rng.uniform(0.05, 0.15)  # 5-15c edge
                     fair_value = market_price + edge
                 elif strategy_type == 'fixed':
-                    edge = np.random.uniform(0.05, 0.15)
+                    edge = self._rng.uniform(0.05, 0.15)
                     fair_value = market_price + edge
                 else:
                     edge = 0.05
@@ -244,11 +246,34 @@ class MonteCarloSimulator:
         return analysis
     
     def _calculate_sharpe(self, df: pd.DataFrame) -> float:
-        """Calculate Sharpe ratio"""
-        final_rois = df.groupby('sim_num')['roi'].last()
-        if final_rois.std() == 0:
+        """
+        Calculate Sharpe ratio properly across time within simulations.
+        Computes per-trade returns within each simulation, then averages the Sharpe ratios.
+        """
+        sharpe_ratios = []
+
+        for sim_num in df['sim_num'].unique():
+            sim_data = df[df['sim_num'] == sim_num].copy()
+            if len(sim_data) < 2:
+                continue
+
+            # Calculate per-trade returns within this simulation
+            sim_data['returns'] = sim_data['pnl'] / sim_data['bankroll'].shift(1)
+            sim_data = sim_data.dropna(subset=['returns'])
+
+            if len(sim_data) == 0:
+                continue
+
+            mean_return = sim_data['returns'].mean()
+            std_return = sim_data['returns'].std()
+
+            if std_return > 0:
+                sharpe_ratios.append(mean_return / std_return)
+
+        if not sharpe_ratios:
             return 0.0
-        return final_rois.mean() / final_rois.std()
+
+        return np.mean(sharpe_ratios)
     
     def _calculate_max_drawdown(self, df: pd.DataFrame) -> float:
         """Calculate maximum drawdown across all simulations"""
@@ -284,7 +309,7 @@ class MonteCarloSimulator:
 
         # Sample simulations to plot
         unique_sims = df['sim_num'].unique()
-        sample_sims = np.random.choice(
+        sample_sims = self._rng.choice(
             unique_sims,
             size=min(num_samples, len(unique_sims)),
             replace=False

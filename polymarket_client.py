@@ -216,6 +216,29 @@ class PolymarketClient:
         self._session: Optional[aiohttp.ClientSession] = None
         self._ws_connection: Optional[websockets.WebSocketClientProtocol] = None
         self._ws_callbacks: Dict[str, List[Callable]] = {}
+        self._ws_reconnect_attempts = 0
+        self._ws_max_reconnect_attempts = 10
+        self._ws_reconnect_delay = 1.0  # Start with 1 second
+        self._ws_subscribed_tokens: List[str] = []
+        self._ws_running = False
+
+    def __repr__(self) -> str:
+        """Safe string representation that masks credentials."""
+        masked_key = f"{self.api_key[:4]}***" if self.api_key and len(self.api_key) > 4 else "***"
+        return f"<PolymarketClient api_key={masked_key} base_url={self.base_url}>"
+
+    def __str__(self) -> str:
+        """Safe string representation that masks credentials."""
+        return self.__repr__()
+
+    @staticmethod
+    def _mask_credential(credential: Optional[str], visible_chars: int = 4) -> str:
+        """Mask a credential for safe logging."""
+        if not credential:
+            return "<not set>"
+        if len(credential) <= visible_chars:
+            return "***"
+        return f"{credential[:visible_chars]}***"
 
     async def __aenter__(self):
         await self.connect()
@@ -506,7 +529,13 @@ class PolymarketClient:
     ):
         """Subscribe to order book updates via WebSocket"""
         if not self._ws_connection:
-            self._ws_connection = await websockets.connect(self.ws_url)
+            if not await self._ws_connect():
+                raise ConnectionError("Failed to establish WebSocket connection")
+
+        # Track subscribed tokens for reconnection
+        for tid in token_ids:
+            if tid not in self._ws_subscribed_tokens:
+                self._ws_subscribed_tokens.append(tid)
 
         # Subscribe to tokens
         subscribe_msg = {
@@ -524,38 +553,107 @@ class PolymarketClient:
 
         logger.info(f"Subscribed to order book updates for {len(token_ids)} tokens")
 
-    async def start_websocket_listener(self):
-        """Start listening to WebSocket messages"""
-        if not self._ws_connection:
-            logger.error("No WebSocket connection")
-            return
-
+    async def _ws_connect(self) -> bool:
+        """Establish WebSocket connection with retry logic."""
         try:
-            async for message in self._ws_connection:
-                data = json.loads(message)
-
-                if data.get('type') == 'book':
-                    token_id = data.get('asset_id')
-                    if token_id in self._ws_callbacks:
-                        order_book = OrderBook(
-                            token_id=token_id,
-                            bids=[
-                                OrderBookEntry(float(b['price']), float(b['size']))
-                                for b in data.get('bids', [])
-                            ],
-                            asks=[
-                                OrderBookEntry(float(a['price']), float(a['size']))
-                                for a in data.get('asks', [])
-                            ],
-                            timestamp=datetime.now()
-                        )
-                        for callback in self._ws_callbacks[token_id]:
-                            await callback(token_id, order_book)
-
-        except websockets.exceptions.ConnectionClosed:
-            logger.warning("WebSocket connection closed")
+            self._ws_connection = await websockets.connect(
+                self.ws_url,
+                ping_interval=30,  # Send ping every 30 seconds
+                ping_timeout=10,   # Wait 10 seconds for pong
+            )
+            self._ws_reconnect_attempts = 0
+            self._ws_reconnect_delay = 1.0
+            logger.info("WebSocket connected successfully")
+            return True
         except Exception as e:
-            logger.error(f"WebSocket error: {e}")
+            logger.error(f"WebSocket connection failed: {e}")
+            return False
+
+    async def _ws_reconnect(self) -> bool:
+        """Attempt to reconnect WebSocket with exponential backoff."""
+        if self._ws_reconnect_attempts >= self._ws_max_reconnect_attempts:
+            logger.error(f"Max WebSocket reconnection attempts ({self._ws_max_reconnect_attempts}) reached")
+            return False
+
+        self._ws_reconnect_attempts += 1
+        delay = min(self._ws_reconnect_delay * (2 ** (self._ws_reconnect_attempts - 1)), 300)  # Cap at 5 minutes
+
+        logger.info(f"WebSocket reconnecting in {delay:.1f}s (attempt {self._ws_reconnect_attempts}/{self._ws_max_reconnect_attempts})")
+        await asyncio.sleep(delay)
+
+        if await self._ws_connect():
+            # Re-subscribe to previously subscribed tokens
+            if self._ws_subscribed_tokens:
+                subscribe_msg = {
+                    'type': 'subscribe',
+                    'channel': 'book',
+                    'assets': self._ws_subscribed_tokens
+                }
+                await self._ws_connection.send(json.dumps(subscribe_msg))
+                logger.info(f"Re-subscribed to {len(self._ws_subscribed_tokens)} tokens")
+            return True
+        return False
+
+    async def start_websocket_listener(self):
+        """Start listening to WebSocket messages with automatic reconnection."""
+        self._ws_running = True
+
+        while self._ws_running:
+            if not self._ws_connection:
+                if not await self._ws_connect():
+                    if not await self._ws_reconnect():
+                        logger.error("WebSocket listener stopping due to connection failure")
+                        break
+                    continue
+
+            try:
+                async for message in self._ws_connection:
+                    data = json.loads(message)
+
+                    if data.get('type') == 'book':
+                        token_id = data.get('asset_id')
+                        if token_id in self._ws_callbacks:
+                            order_book = OrderBook(
+                                token_id=token_id,
+                                bids=[
+                                    OrderBookEntry(float(b['price']), float(b['size']))
+                                    for b in data.get('bids', [])
+                                ],
+                                asks=[
+                                    OrderBookEntry(float(a['price']), float(a['size']))
+                                    for a in data.get('asks', [])
+                                ],
+                                timestamp=datetime.now()
+                            )
+                            for callback in self._ws_callbacks[token_id]:
+                                try:
+                                    await callback(token_id, order_book)
+                                except Exception as e:
+                                    logger.error(f"WebSocket callback error: {e}")
+
+            except websockets.exceptions.ConnectionClosed as e:
+                logger.warning(f"WebSocket connection closed: {e}")
+                self._ws_connection = None
+                if self._ws_running:
+                    if not await self._ws_reconnect():
+                        break
+            except Exception as e:
+                logger.error(f"WebSocket error: {e}")
+                self._ws_connection = None
+                if self._ws_running:
+                    if not await self._ws_reconnect():
+                        break
+
+        self._ws_running = False
+        logger.info("WebSocket listener stopped")
+
+    async def stop_websocket_listener(self):
+        """Stop the WebSocket listener gracefully."""
+        self._ws_running = False
+        if self._ws_connection:
+            await self._ws_connection.close()
+            self._ws_connection = None
+        logger.info("WebSocket listener stop requested")
 
     # === Utility Methods ===
 

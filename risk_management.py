@@ -5,7 +5,7 @@ Kelly Criterion, portfolio optimization, and risk controls
 
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from scipy.optimize import minimize
 
@@ -226,20 +226,64 @@ class RiskManager:
 
         return shares
     
-    def check_position_limits(self,
-                            position: Position,
-                            portfolio_value: float) -> Dict:
-        """Check if position violates risk limits"""
-        
+    def check_position_limits(
+        self,
+        position: Position,
+        portfolio_value: float,
+        all_positions: Optional[List[Position]] = None
+    ) -> Dict:
+        """
+        Check if position violates risk limits.
+
+        Args:
+            position: Position to check
+            portfolio_value: Total portfolio value
+            all_positions: Optional list of all positions for market exposure check
+
+        Returns:
+            Dict with limit check results
+        """
+        if portfolio_value <= 0:
+            return {
+                'position_size_ok': False,
+                'position_size_pct': 0,
+                'stop_loss_triggered': False,
+                'pnl_pct': 0,
+                'market_exposure_ok': False,
+                'market_exposure_pct': 0,
+                'reason': 'Invalid portfolio value'
+            }
+
         position_size_pct = position.cost_basis / portfolio_value
-        
+
+        # Calculate market exposure if all positions provided
+        market_exposure_pct = 0.0
+        market_exposure_ok = True
+
+        if all_positions:
+            # Sum up all positions in the same market
+            market_exposure = sum(
+                p.cost_basis for p in all_positions
+                if p.market_id == position.market_id
+            )
+            market_exposure_pct = market_exposure / portfolio_value
+            market_exposure_ok = market_exposure_pct <= self.max_market_exposure
+
+            if not market_exposure_ok:
+                logger.warning(
+                    f"Market exposure limit exceeded for {position.market_id}: "
+                    f"{market_exposure_pct:.2%} > {self.max_market_exposure:.2%}"
+                )
+
         checks = {
             'position_size_ok': position_size_pct <= self.max_position_size,
             'position_size_pct': position_size_pct,
             'stop_loss_triggered': position.pnl_pct <= (self.stop_loss_pct * 100),
-            'pnl_pct': position.pnl_pct
+            'pnl_pct': position.pnl_pct,
+            'market_exposure_ok': market_exposure_ok,
+            'market_exposure_pct': market_exposure_pct
         }
-        
+
         return checks
     
     def calculate_portfolio_risk(self, positions: List[Position]) -> Dict:
@@ -413,26 +457,55 @@ class RiskManager:
             'remaining_drawdown_budget_pct': (drawdown - self.max_drawdown_limit) * 100
         }
 
-    def get_drawdown_adjusted_size(self, base_kelly_fraction: float) -> float:
+    def get_drawdown_adjusted_size(
+        self,
+        base_kelly_fraction: float,
+        current_portfolio_value: float
+    ) -> float:
         """
         Adjust position size based on current drawdown.
         Reduces size during drawdowns to preserve capital.
 
         Args:
             base_kelly_fraction: Base Kelly fraction
+            current_portfolio_value: Current portfolio value
 
         Returns:
             Adjusted Kelly fraction
         """
-        if not self.drawdown_sizing_enabled or self.peak_portfolio_value <= 0:
+        if not self.drawdown_sizing_enabled:
             return base_kelly_fraction
 
-        # Calculate current drawdown
-        # Note: This needs current portfolio value, which should be passed
-        # For now, use a scaling factor based on how close we are to max drawdown
-        # This is a simplified implementation
+        if current_portfolio_value <= 0 or self.peak_portfolio_value <= 0:
+            return 0.0
 
-        return base_kelly_fraction
+        # Calculate current drawdown (will be 0 or negative)
+        current_drawdown = (current_portfolio_value - self.peak_portfolio_value) / self.peak_portfolio_value
+
+        # If not in drawdown, return base fraction
+        if current_drawdown >= 0:
+            return base_kelly_fraction
+
+        # Calculate how deep we are into max drawdown (0 to 1)
+        # At 0% drawdown: ratio = 0, at max_drawdown: ratio = 1
+        drawdown_ratio = abs(current_drawdown) / abs(self.max_drawdown_limit)
+
+        # Clamp ratio to 1 (shouldn't exceed, but safety check)
+        drawdown_ratio = min(drawdown_ratio, 1.0)
+
+        # Linear reduction: at 50% of max drawdown, reduce to 50% of base size
+        # Never reduce below 25% of base size to maintain some activity
+        reduction_factor = max(0.25, 1.0 - drawdown_ratio)
+
+        adjusted = base_kelly_fraction * reduction_factor
+
+        logger.debug(
+            f"Drawdown adjustment: base={base_kelly_fraction:.2%}, "
+            f"drawdown={current_drawdown:.2%}, ratio={drawdown_ratio:.2%}, "
+            f"adjusted={adjusted:.2%}"
+        )
+
+        return adjusted
 
     def calculate_position_size_with_drawdown(
         self,

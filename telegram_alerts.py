@@ -5,14 +5,83 @@ Sends real-time notifications for trades, positions, and risk alerts
 
 import asyncio
 import aiohttp
+import html
+import time
 from typing import Optional, Dict, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-
 from logger import get_logger
 
 logger = get_logger(__name__)
+
+
+class AlertRateLimiter:
+    """Rate limiter for Telegram alerts to avoid hitting API limits."""
+
+    def __init__(
+        self,
+        max_messages_per_second: float = 2.0,
+        cooldown_seconds: float = 1.0,
+        alert_type_cooldown: float = 60.0
+    ):
+        """
+        Initialize rate limiter.
+
+        Args:
+            max_messages_per_second: Maximum messages per second (Telegram limit is ~30/sec)
+            cooldown_seconds: Minimum time between any two messages
+            alert_type_cooldown: Minimum time between same alert type
+        """
+        self.max_messages_per_second = max_messages_per_second
+        self.cooldown_seconds = cooldown_seconds
+        self.alert_type_cooldown = alert_type_cooldown
+
+        self._last_message_time = 0.0
+        self._alert_type_times: Dict[str, float] = {}
+        self._lock = asyncio.Lock()
+
+    async def acquire(self, alert_type: str = "default") -> bool:
+        """
+        Acquire permission to send a message.
+
+        Args:
+            alert_type: Type of alert for per-type rate limiting
+
+        Returns:
+            True if allowed to send, False if rate limited
+        """
+        async with self._lock:
+            now = time.monotonic()
+
+            # Check global cooldown (skip if this is the first message)
+            if self._last_message_time > 0:
+                time_since_last = now - self._last_message_time
+                if time_since_last < self.cooldown_seconds:
+                    wait_time = self.cooldown_seconds - time_since_last
+                    logger.debug(f"Rate limit: waiting {wait_time:.2f}s (global cooldown)")
+                    await asyncio.sleep(wait_time)
+                    now = time.monotonic()
+
+            # Check per-alert-type cooldown (skip if never seen this type)
+            if alert_type in self._alert_type_times:
+                time_since_type = now - self._alert_type_times[alert_type]
+                if time_since_type < self.alert_type_cooldown:
+                    logger.debug(
+                        f"Rate limit: skipping {alert_type} (cooldown: "
+                        f"{self.alert_type_cooldown - time_since_type:.1f}s remaining)"
+                    )
+                    return False
+
+            # Update timestamps
+            self._last_message_time = now
+            self._alert_type_times[alert_type] = now
+
+            return True
+
+    def reset_cooldown(self, alert_type: str) -> None:
+        """Reset cooldown for a specific alert type."""
+        self._alert_type_times[alert_type] = 0.0
 
 
 class AlertLevel(Enum):
@@ -50,6 +119,11 @@ class TelegramNotifier:
     def __init__(self, config: TelegramConfig):
         self.config = config
         self._session: Optional[aiohttp.ClientSession] = None
+        self._rate_limiter = AlertRateLimiter(
+            max_messages_per_second=2.0,
+            cooldown_seconds=0.5,
+            alert_type_cooldown=60.0  # Same alert type has 60s cooldown
+        )
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session"""
@@ -72,13 +146,21 @@ class TelegramNotifier:
         }
         return emojis.get(level, "📢")
 
-    async def send_message(self, text: str, parse_mode: str = "HTML") -> bool:
+    async def send_message(
+        self,
+        text: str,
+        parse_mode: str = "HTML",
+        alert_type: str = "default",
+        bypass_rate_limit: bool = False
+    ) -> bool:
         """
-        Send a message via Telegram.
+        Send a message via Telegram with rate limiting.
 
         Args:
             text: Message text (supports HTML formatting)
             parse_mode: Parse mode (HTML or Markdown)
+            alert_type: Type of alert for rate limiting (same types have cooldown)
+            bypass_rate_limit: If True, skip rate limiting (for critical alerts)
 
         Returns:
             True if sent successfully
@@ -90,6 +172,12 @@ class TelegramNotifier:
         if not self.config.bot_token or not self.config.chat_id:
             logger.warning("Telegram not configured (missing token or chat_id)")
             return False
+
+        # Apply rate limiting unless bypassed
+        if not bypass_rate_limit:
+            if not await self._rate_limiter.acquire(alert_type):
+                logger.debug(f"Rate limited: skipping {alert_type} alert")
+                return False
 
         try:
             session = await self._get_session()
@@ -105,6 +193,10 @@ class TelegramNotifier:
                 if response.status == 200:
                     logger.debug("Telegram message sent successfully")
                     return True
+                elif response.status == 429:  # Too Many Requests
+                    retry_after = int(response.headers.get('Retry-After', 30))
+                    logger.warning(f"Telegram rate limited, retry after {retry_after}s")
+                    return False
                 else:
                     error_text = await response.text()
                     logger.error(f"Telegram API error: {response.status} - {error_text}")
@@ -129,10 +221,13 @@ class TelegramNotifier:
         mode = "📝 PAPER" if paper else "💰 LIVE"
         action_emoji = "🟢 BUY" if action == "BUY" else "🔴 SELL"
 
+        # Escape user-provided data to prevent HTML injection
+        safe_market_id = html.escape(str(market_id)[:20])
+
         message = f"""
 {mode} <b>Trade Executed</b>
 
-{action_emoji} <code>{market_id[:20]}...</code>
+{action_emoji} <code>{safe_market_id}...</code>
 ├ Shares: <b>{shares}</b>
 ├ Price: <b>${price:.4f}</b>
 ├ Cost: <b>${shares * price:.2f}</b>
@@ -140,7 +235,7 @@ class TelegramNotifier:
 
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
-        await self.send_message(message.strip())
+        await self.send_message(message.strip(), alert_type="trade_executed")
 
     async def alert_position_update(
         self,
@@ -154,17 +249,20 @@ class TelegramNotifier:
         """Send alert for position P&L update"""
         pnl_emoji = "📈" if pnl >= 0 else "📉"
 
+        # Escape user-provided data
+        safe_market_id = html.escape(str(market_id)[:20])
+
         message = f"""
 {pnl_emoji} <b>Position Update</b>
 
-<code>{market_id[:20]}...</code>
+<code>{safe_market_id}...</code>
 ├ Shares: <b>{shares}</b>
 ├ Entry: <b>${entry_price:.4f}</b>
 ├ Current: <b>${current_price:.4f}</b>
 ├ P&L: <b>${pnl:.2f}</b>
 └ P&L %: <b>{pnl_pct:+.2f}%</b>
 """
-        await self.send_message(message.strip())
+        await self.send_message(message.strip(), alert_type="position_update")
 
     async def alert_arbitrage_opportunity(
         self,
@@ -177,17 +275,20 @@ class TelegramNotifier:
         """Send alert when arbitrage opportunity is found"""
         status = "✅ EXECUTED" if executed else "👀 DETECTED"
 
+        # Escape user-provided data
+        safe_opp_type = html.escape(str(opp_type))
+
         message = f"""
 🎯 <b>Arbitrage Opportunity {status}</b>
 
-Type: <b>{opp_type}</b>
+Type: <b>{safe_opp_type}</b>
 ├ Profit: <b>${profit:.4f}</b>
 ├ Edge: <b>{profit_pct:.2f}%</b>
 └ Markets: <code>{len(markets)} outcomes</code>
 
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
-        await self.send_message(message.strip())
+        await self.send_message(message.strip(), alert_type="arbitrage_opportunity")
 
     async def alert_risk_warning(
         self,
@@ -201,14 +302,19 @@ Type: <b>{opp_type}</b>
         if current_value is not None and limit_value is not None:
             details = f"\n├ Current: <b>{current_value:.2%}</b>\n└ Limit: <b>{limit_value:.2%}</b>"
 
-        message = f"""
-⚠️ <b>RISK ALERT: {alert_type}</b>
+        # Escape user-provided data
+        safe_alert_type = html.escape(str(alert_type))
+        safe_message_text = html.escape(str(message_text))
 
-{message_text}{details}
+        message = f"""
+⚠️ <b>RISK ALERT: {safe_alert_type}</b>
+
+{safe_message_text}{details}
 
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
-        await self.send_message(message.strip())
+        # Risk warnings bypass rate limit - they're important
+        await self.send_message(message.strip(), alert_type="risk_warning", bypass_rate_limit=True)
 
     async def alert_stop_loss_triggered(
         self,
@@ -217,10 +323,13 @@ Type: <b>{opp_type}</b>
         shares: int
     ):
         """Send alert when stop loss is triggered"""
+        # Escape user-provided data
+        safe_market_id = html.escape(str(market_id)[:20])
+
         message = f"""
 🛑 <b>STOP LOSS TRIGGERED</b>
 
-<code>{market_id[:20]}...</code>
+<code>{safe_market_id}...</code>
 ├ Loss: <b>{pnl_pct:.2f}%</b>
 └ Shares Closed: <b>{shares}</b>
 
@@ -228,7 +337,8 @@ Position closed to prevent further losses.
 
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
-        await self.send_message(message.strip())
+        # Stop loss is critical - bypass rate limit
+        await self.send_message(message.strip(), alert_type="stop_loss", bypass_rate_limit=True)
 
     async def alert_daily_limit_hit(
         self,
@@ -248,7 +358,8 @@ Trading will resume tomorrow.
 
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
-        await self.send_message(message.strip())
+        # Critical alert - bypass rate limit
+        await self.send_message(message.strip(), alert_type="daily_limit", bypass_rate_limit=True)
 
     async def alert_drawdown_limit_hit(
         self,
@@ -268,7 +379,8 @@ Manual intervention required to resume.
 
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
-        await self.send_message(message.strip())
+        # Critical alert - bypass rate limit
+        await self.send_message(message.strip(), alert_type="drawdown_limit", bypass_rate_limit=True)
 
     async def alert_daily_summary(
         self,
@@ -294,7 +406,7 @@ Manual intervention required to resume.
 
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
-        await self.send_message(message.strip())
+        await self.send_message(message.strip(), alert_type="daily_summary")
 
     async def alert_bot_started(
         self,
@@ -303,40 +415,53 @@ Manual intervention required to resume.
         strategy: str
     ):
         """Send alert when bot starts"""
+        # Escape user-provided data
+        safe_mode = html.escape(str(mode))
+        safe_strategy = html.escape(str(strategy))
+
         message = f"""
 🤖 <b>Trading Bot Started</b>
 
-├ Mode: <b>{mode}</b>
-├ Strategy: <b>{strategy}</b>
+├ Mode: <b>{safe_mode}</b>
+├ Strategy: <b>{safe_strategy}</b>
 └ Bankroll: <b>${bankroll:,.2f}</b>
 
 Bot is now monitoring for opportunities.
 
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
-        await self.send_message(message.strip())
+        # Bot start is important - bypass rate limit
+        await self.send_message(message.strip(), alert_type="bot_started", bypass_rate_limit=True)
 
     async def alert_bot_stopped(self, reason: str = "Manual shutdown"):
         """Send alert when bot stops"""
+        # Escape user-provided data
+        safe_reason = html.escape(str(reason))
+
         message = f"""
 🔴 <b>Trading Bot Stopped</b>
 
-Reason: {reason}
+Reason: {safe_reason}
 
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
-        await self.send_message(message.strip())
+        # Bot stop is important - bypass rate limit
+        await self.send_message(message.strip(), alert_type="bot_stopped", bypass_rate_limit=True)
 
     async def alert_error(self, error_type: str, error_message: str):
         """Send alert for errors"""
-        message = f"""
-❌ <b>Error: {error_type}</b>
+        # Escape user-provided data to prevent HTML injection
+        safe_error_type = html.escape(str(error_type))
+        safe_error_message = html.escape(str(error_message)[:500])
 
-<code>{error_message[:500]}</code>
+        message = f"""
+❌ <b>Error: {safe_error_type}</b>
+
+<code>{safe_error_message}</code>
 
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
-        await self.send_message(message.strip())
+        await self.send_message(message.strip(), alert_type="error")
 
 
 # === Factory function ===

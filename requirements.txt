@@ -9,6 +9,18 @@ scipy>=1.10.0
 aiohttp>=3.8.0
 websockets>=11.0
 
+# Blockchain (Polygon monitoring)
+web3>=6.0.0
+
+# Configuration
+pyyaml>=6.0
+
+# LLM (dependency detection)
+anthropic>=0.20.0
+
+# Optimization (IP solver)
+# gurobipy - Install separately with license
+
 # Visualization
 matplotlib>=3.7.0
 
