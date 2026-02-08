@@ -6,9 +6,14 @@ Runs the arbitrage detection system in paper trading mode:
 - Fetches live market data from Polymarket
 - Scans for arbitrage opportunities
 - Simulates trades WITHOUT using real money
+- Writes status to data/bot_status.json for monitoring
 
 Usage:
     python paper_trade_test.py [--duration MINUTES]
+
+Monitor status from another terminal:
+    python -m src.monitor status
+    python -m src.monitor watch
 """
 
 import asyncio
@@ -24,6 +29,8 @@ import aiohttp
 
 # Setup path
 sys.path.insert(0, str(Path(__file__).parent))
+
+from src.monitor import StatusManager
 
 from src.data.websocket_feed import OrderBook, OrderBookLevel
 from src.detection.simple_arbitrage import (
@@ -226,67 +233,87 @@ async def run_paper_trading(duration_minutes: int = 5):
     print("=" * 60)
     print(f"Duration: {duration_minutes} minutes")
     print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("Monitor status: python -m src.monitor watch")
     print("=" * 60)
 
     trader = PaperTrader(initial_balance=10000.0)
     trader.start_time = datetime.utcnow()
     end_time = trader.start_time + timedelta(minutes=duration_minutes)
 
+    # Initialize status manager for monitoring
+    status_mgr = StatusManager()
+    status_mgr.start(mode="paper", initial_balance=10000.0)
+
     scan_count = 0
     all_opportunities = []
 
-    while datetime.utcnow() < end_time:
-        scan_count += 1
-        print(f"\n[Scan #{scan_count}] {datetime.now().strftime('%H:%M:%S')}")
+    try:
+        while datetime.utcnow() < end_time:
+            scan_count += 1
+            print(f"\n[Scan #{scan_count}] {datetime.now().strftime('%H:%M:%S')}")
 
-        # Fetch live markets
-        print("  Fetching live markets...")
-        markets = await fetch_live_markets(limit=50)
-        print(f"  Found {len(markets)} active markets")
+            # Fetch live markets
+            print("  Fetching live markets...")
+            markets = await fetch_live_markets(limit=50)
+            print(f"  Found {len(markets)} active markets")
 
-        if not markets:
-            await asyncio.sleep(30)
-            continue
+            # Update status
+            status_mgr.update_scan(len(markets))
 
-        # Check for simple arbitrage
-        print("  Checking for arbitrage opportunities...")
-        simple_opps = check_simple_arbitrage(markets)
+            if not markets:
+                await asyncio.sleep(30)
+                continue
 
-        if simple_opps:
-            print(f"\n  *** FOUND {len(simple_opps)} OPPORTUNITIES ***")
-            for opp in simple_opps:
-                q = opp['market']['question'][:50]
-                print(f"    {opp['type'].upper()}: {q}...")
-                print(f"      Prices sum: {opp['price_sum']:.4f}")
-                print(f"      Profit: {opp['profit_pct']:.2f}%")
-                trader.opportunities_found += 1
-                all_opportunities.append(opp)
-        else:
-            print("  No simple arbitrage found (markets efficiently priced)")
+            # Check for simple arbitrage
+            print("  Checking for arbitrage opportunities...")
+            simple_opps = check_simple_arbitrage(markets)
 
-        # Check IP solver
-        print("\n  Running IP solver analysis...")
-        ip_result = check_ip_arbitrage(markets)
-        print(f"    Min cost: ${ip_result['min_cost']:.4f}")
-        print(f"    Arbitrage: {ip_result['has_arbitrage']}")
-        if ip_result['has_arbitrage']:
-            print(f"    Potential profit: ${ip_result['profit']:.4f}")
+            if simple_opps:
+                print(f"\n  *** FOUND {len(simple_opps)} OPPORTUNITIES ***")
+                for opp in simple_opps:
+                    q = opp['market']['question'][:50]
+                    print(f"    {opp['type'].upper()}: {q}...")
+                    print(f"      Prices sum: {opp['price_sum']:.4f}")
+                    print(f"      Profit: {opp['profit_pct']:.2f}%")
+                    trader.opportunities_found += 1
+                    all_opportunities.append(opp)
+                    # Record to status
+                    status_mgr.add_opportunity(opp)
+            else:
+                print("  No simple arbitrage found (markets efficiently priced)")
 
-        # Show market summary
-        print("\n  Sample market prices:")
-        for m in markets[:5]:
-            q = m['question'][:40]
-            p = m['prices']
-            s = sum(p)
-            print(f"    {q}... | Sum: {s:.4f}")
+            # Check IP solver
+            print("\n  Running IP solver analysis...")
+            ip_result = check_ip_arbitrage(markets)
+            print(f"    Min cost: ${ip_result['min_cost']:.4f}")
+            print(f"    Arbitrage: {ip_result['has_arbitrage']}")
+            if ip_result['has_arbitrage']:
+                print(f"    Potential profit: ${ip_result['profit']:.4f}")
 
-        # Wait before next scan
-        remaining = (end_time - datetime.utcnow()).total_seconds()
-        if remaining > 30:
-            print(f"\n  Next scan in 30s... ({remaining/60:.1f} min remaining)")
-            await asyncio.sleep(30)
-        elif remaining > 0:
-            await asyncio.sleep(remaining)
+            # Update balance in status
+            status_mgr.update_balance(trader.balance)
+
+            # Show market summary
+            print("\n  Sample market prices:")
+            for m in markets[:5]:
+                q = m['question'][:40]
+                p = m['prices']
+                s = sum(p)
+                print(f"    {q}... | Sum: {s:.4f}")
+
+            # Wait before next scan
+            remaining = (end_time - datetime.utcnow()).total_seconds()
+            if remaining > 30:
+                print(f"\n  Next scan in 30s... ({remaining/60:.1f} min remaining)")
+                await asyncio.sleep(30)
+            elif remaining > 0:
+                await asyncio.sleep(remaining)
+
+    except Exception as e:
+        status_mgr.record_error(str(e))
+        raise
+    finally:
+        status_mgr.stop()
 
     # Final summary
     summary = trader.get_summary()
